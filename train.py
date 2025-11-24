@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 Train on raw observation points (no spatial interpolation).
-Uses dataset.RawPointDataset and utils.load_csv (which maps common column names).
-Loss: MAE (L1). Split: 85%/15% by default (random).
-Outputs eval_per_var.csv and eval_per_day.csv in --out_dir.
-"""
+Supports:
+  - legacy single CSV with random train/test split (default, --csv + --val_frac)
+  - explicit train/test CSV files (--train_csv and --test_csv) for fixed split (no random split)
 
-# usage example:
-# python train.py --csv processed_data_mean.csv --epochs 60 --batch 512 --lr 1e-3 --posenc --posenc_freqs 6 --val_frac 0.15 --hidden 256,256,128 --ckpt_dir checkpoints_nointerp --out_dir eval_nointerp
+Loss: MAE (L1). Outputs eval_per_var.csv and eval_per_day.csv in --out_dir.
+
+cmd
+python train.py --train_csv processed_data_mean_train.csv --test_csv processed_data_mean_test.csv --epochs 60 --batch 512 --lr 1e-3 --posenc --posenc_freqs 6 --ckpt_dir checkpoints_nointerp --out_dir eval_nointerp
+"""
 
 import argparse
 import os
@@ -15,7 +17,6 @@ import random
 from collections import defaultdict
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -46,7 +47,7 @@ class MLP(nn.Module):
         return self.net(x)
 
 # -------------------------
-# Helpers: metrics & eval save
+# Helpers: evaluation + save
 # -------------------------
 def evaluate_model(model, loader, device):
     model.eval()
@@ -60,7 +61,6 @@ def evaluate_model(model, loader, device):
             pred = model(x)
             all_preds.append(pred.cpu().numpy())
             all_trues.append(y.cpu().numpy())
-            # dates is list of ISO strings (or possibly date objects), extend directly
             all_dates.extend(dates)
     preds = np.concatenate(all_preds, axis=0)
     trues = np.concatenate(all_trues, axis=0)
@@ -71,6 +71,7 @@ def save_eval_csvs(preds, trues, dates, out_dir):
     # per-var MAE
     mae_per_var = np.mean(np.abs(preds - trues), axis=0)
     count = preds.shape[0]
+    import pandas as pd
     df_var = pd.DataFrame({
         'variable': ['so','thetao','uo','vo'],
         'mae': mae_per_var,
@@ -78,17 +79,10 @@ def save_eval_csvs(preds, trues, dates, out_dir):
     })
     df_var.to_csv(os.path.join(out_dir, 'eval_per_var.csv'), index=False)
 
-    # per-day aggregation
+    # per-day aggregation (dates may be ISO strings)
     day_map = defaultdict(list)
     for i, d in enumerate(dates):
-        # d may be an ISO string or a date object. Use ISO string as key for safe sorting.
-        if isinstance(d, str):
-            key = d
-        else:
-            try:
-                key = d.isoformat()
-            except Exception:
-                key = str(d)
+        key = d if isinstance(d, str) else (d.isoformat() if hasattr(d, 'isoformat') else str(d))
         day_map[key].append(np.abs(preds[i] - trues[i]))
     rows = []
     for key in sorted(day_map.keys()):
@@ -110,7 +104,7 @@ def save_eval_csvs(preds, trues, dates, out_dir):
     df_day.to_csv(os.path.join(out_dir, 'eval_per_day.csv'), index=False)
 
 # -------------------------
-# Training
+# Training loop
 # -------------------------
 def train_loop(model, train_loader, val_loader, device, epochs, lr, ckpt_dir):
     opt = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
@@ -134,7 +128,7 @@ def train_loop(model, train_loader, val_loader, device, epochs, lr, ckpt_dir):
             n += bs
         train_mae = total_loss / max(1, n)
 
-        # val
+        # validation
         model.eval()
         total_loss = 0.0
         n = 0
@@ -163,7 +157,11 @@ def train_loop(model, train_loader, val_loader, device, epochs, lr, ckpt_dir):
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--csv', default='processed_data_mean.csv', help='input csv')
+    # legacy single CSV mode (random split)
+    parser.add_argument('--csv', default='processed_data_mean.csv', help='single CSV for random train/test split (legacy)')
+    # new explicit train/test mode
+    parser.add_argument('--train_csv', default=None, help='CSV file to use as training set (fixed)')
+    parser.add_argument('--test_csv', default=None, help='CSV file to use as test set (fixed)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--batch', type=int, default=512)
     parser.add_argument('--epochs', type=int, default=60)
@@ -172,7 +170,7 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.0)
     parser.add_argument('--posenc', action='store_true', help='use positional encodings')
     parser.add_argument('--posenc_freqs', type=int, default=6)
-    parser.add_argument('--val_frac', type=float, default=0.15)
+    parser.add_argument('--val_frac', type=float, default=0.15, help='used only in single-CSV mode')
     parser.add_argument('--ckpt_dir', type=str, default='checkpoints_nointerp')
     parser.add_argument('--out_dir', type=str, default='eval_nointerp')
     args = parser.parse_args()
@@ -182,26 +180,52 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # load data (auto-maps column names)
-    df = load_csv(args.csv)
-
-    # create dataset using raw points (no interpolation)
-    dataset = RawPointDataset(df, use_posenc=args.posenc, posenc_freqs=args.posenc_freqs, scale=True)
-    n = len(dataset)
-    n_test = max(1, int(n * args.val_frac))
-    n_train = n - n_test
-    train_set, test_set = random_split(dataset, [n_train, n_test], generator=torch.Generator().manual_seed(args.seed))
-
+    # device and pin_memory decision
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    train_loader = DataLoader(train_set, batch_size=args.batch, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=args.batch, shuffle=False, num_workers=4, pin_memory=True)
+    pin_mem = True if device.type == 'cuda' else False
 
-    in_dim = dataset.X.shape[1]
+    # --------- load data ----------
+    if args.train_csv is not None and args.test_csv is not None:
+        if args.train_csv == args.test_csv:
+            print("Warning: --train_csv and --test_csv are identical. Proceeding but results will be trivial.")
+        print(f"Loading fixed train CSV: {args.train_csv}")
+        df_train = load_csv(args.train_csv)
+        print(f"Loading fixed test CSV: {args.test_csv}")
+        df_test = load_csv(args.test_csv)
+
+        dataset_train = RawPointDataset(df_train, use_posenc=args.posenc, posenc_freqs=args.posenc_freqs, scale=True)
+        dataset_test  = RawPointDataset(df_test,  use_posenc=args.posenc, posenc_freqs=args.posenc_freqs, scale=True)
+
+        n_train = len(dataset_train)
+        n_test = len(dataset_test)
+        n_total = n_train + n_test
+
+        train_loader = DataLoader(dataset_train, batch_size=args.batch, shuffle=True, num_workers=4, pin_memory=pin_mem)
+        test_loader  = DataLoader(dataset_test,  batch_size=args.batch, shuffle=False, num_workers=4, pin_memory=pin_mem)
+
+    else:
+        # legacy single CSV mode with random split
+        print(f"Loading single CSV and splitting: {args.csv}")
+        df = load_csv(args.csv)
+        dataset = RawPointDataset(df, use_posenc=args.posenc, posenc_freqs=args.posenc_freqs, scale=True)
+        n_total = len(dataset)
+        n_test = max(1, int(n_total * args.val_frac))
+        n_train = n_total - n_test
+        train_set, test_set = random_split(dataset, [n_train, n_test], generator=torch.Generator().manual_seed(args.seed))
+
+        train_loader = DataLoader(train_set, batch_size=args.batch, shuffle=True, num_workers=4, pin_memory=pin_mem)
+        test_loader  = DataLoader(test_set,  batch_size=args.batch, shuffle=False, num_workers=4, pin_memory=pin_mem)
+
+    # -------------------------
+    # model setup
+    # -------------------------
+    in_dim = dataset_train.X.shape[1] if (args.train_csv and args.test_csv) else dataset.X.shape[1]
     hidden = [int(x) for x in args.hidden.split(',') if x.strip()]
     model = MLP(in_dim=in_dim, hidden=hidden, out_dim=4, dropout=args.dropout).to(device)
 
-    print(f"Dataset size: total={n}, train={n_train}, test={n_test}, input_dim={in_dim}")
+    print(f"Dataset size: total={n_total}, train={n_train}, test={n_test}, input_dim={in_dim}")
     print("Training MLP:", model)
+    print(f"Using device: {device}, pin_memory set to {pin_mem}")
 
     # train
     train_loop(model, train_loader, test_loader, device, epochs=args.epochs, lr=args.lr, ckpt_dir=args.ckpt_dir)
